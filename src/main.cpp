@@ -2,10 +2,14 @@
 
 #include <cassert>
 #include <iostream>
+#include <latch>
+#include <ranges>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "SaferStringView.hpp"
 
@@ -13,6 +17,21 @@ template <typename T>
 static bool OwnsData(const amitgdev::SaferStringView<T>& value) {
   return std::holds_alternative<std::basic_string<T>>(value.storage_);
 }
+
+// These two exist only to be exercised from assert() below. assert()
+// compiles away entirely under NDEBUG (i.e. Release builds), which would
+// otherwise leave them as unused functions.
+#ifndef NDEBUG
+
+[[nodiscard]] static bool ConsumeStringView(std::string_view value) {
+  return !value.empty();
+}
+
+[[nodiscard]] static std::string ConsumeCString(const char* value) {
+  return value;
+}
+
+#endif  // NDEBUG
 
 // -----------------------------------------------------------------------------
 // Construction
@@ -170,8 +189,16 @@ static void TestStringViewConversion() {
   std::cout << "  value: \"" << view << "\"\n";
 }
 
+static void TestStringViewConsumer() {
+  const amitgdev::SaferStringView value("String View");
+
+  assert(ConsumeStringView(value));
+
+  std::cout << "  consumed: \"" << std::string_view(value) << "\"\n";
+}
+
 // -----------------------------------------------------------------------------
-// Null termination
+// Null termination & materialization
 // -----------------------------------------------------------------------------
 
 static void TestNullTerminationForKnownTerminatedInput() {
@@ -179,13 +206,180 @@ static void TestNullTerminationForKnownTerminatedInput() {
 
   assert(value.null_terminated());
 
-  // v1: only verify via string_view conversion
-  const std::string_view view = value;
-  assert(view == "Hello");
+  const char* pointer = value.c_str();
 
-  std::cout << "  value: \"" << view << "\"\n"
+  assert(pointer != nullptr);
+
+  const std::string_view c_string(pointer);
+  assert(c_string == "Hello");
+
+  std::cout << "  value: \"" << std::string_view(value) << "\"\n"
             << "  null-terminated: " << std::boolalpha
-            << value.null_terminated() << "\n";
+            << value.null_terminated() << "\n"
+            << "  c_str(): \"" << c_string << "\"\n";
+}
+
+static void TestMaterializesNonTerminatedView() {
+  const std::string source = "prefix|substring|suffix";
+  const std::string_view substring = std::string_view(source).substr(7, 9);
+
+  assert(substring == "substring");
+
+  const amitgdev::SaferStringView value(substring);
+
+  assert(!value.null_terminated());
+  assert(!OwnsData(value));
+
+  std::cout << "  source: \"" << source << "\"\n"
+            << "  view: \"" << substring << "\"\n"
+            << "  before c_str(): owns=" << std::boolalpha << OwnsData(value)
+            << ", null-terminated=" << value.null_terminated() << "\n";
+
+  const char* first = value.c_str();
+
+  assert(value.null_terminated());
+  assert(OwnsData(value));
+
+  const std::string_view materialized(first);
+
+  assert(materialized == substring);
+  assert(materialized.size() == substring.size());
+  assert(ConsumeCString(first) == "substring");
+
+  const char* second = value.c_str();
+
+  assert(second == first);
+  assert(std::string_view(second) == "substring");
+  // The implicit conversion must now read the materialized owned string,
+  // not the original (now-superseded) view into `source`.
+  assert(std::string_view(value) == "substring");
+
+  std::cout << "  after c_str(): owns=" << std::boolalpha << OwnsData(value)
+            << ", null-terminated=" << value.null_terminated() << "\n"
+            << "  c_str(): \"" << materialized << "\"\n"
+            << "  pointer reused: " << (first == second) << "\n";
+}
+
+static void TestMaterializesEmptyView() {
+  const std::string source = "non-empty";
+  const std::string_view empty_view = std::string_view(source).substr(4, 0);
+
+  const amitgdev::SaferStringView value(empty_view);
+
+  assert(!value.null_terminated());
+  assert(!OwnsData(value));
+
+  const char* pointer = value.c_str();
+
+  assert(pointer != nullptr);
+  assert(*pointer == '\0');
+  assert(OwnsData(value));
+  assert(value.null_terminated());
+
+  const std::string_view materialized(pointer);
+
+  assert(materialized.empty());
+  assert(pointer != nullptr);
+  assert(*pointer == '\0');
+
+  std::cout << "  before c_str(): owns=false, null-terminated=false\n"
+            << "  after c_str(): owns=true, null-terminated=true\n"
+            << "  c_str(): \"\"\n";
+}
+
+// -----------------------------------------------------------------------------
+// Concurrency
+// -----------------------------------------------------------------------------
+
+// Validates the documented contract that c_str() and null_terminated() may
+// be called concurrently on the same instance, and that materialization
+// happens exactly once even under contention: every thread must observe the
+// same materialized pointer and correct content. The interleaving
+// itself is non-deterministic, but the asserted outcome is not.
+static void TestConcurrentCStr() {
+  const std::string source = "prefix|concurrent-substring|suffix";
+  const std::string_view substring = std::string_view(source).substr(7, 20);
+
+  assert(substring == "concurrent-substring");
+
+  const amitgdev::SaferStringView value(substring);
+
+  assert(!value.null_terminated());
+
+  constexpr int kThreadCount = 8;
+  std::latch start_line(kThreadCount);
+  std::vector<const char*> results(kThreadCount, nullptr);
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+
+  for (const int index : std::views::iota(0, kThreadCount)) {
+    threads.emplace_back([&value, &start_line, &results, index] {
+      // Maximize contention on the not-yet-materialized fast-path check.
+      start_line.arrive_and_wait();
+      results.at(index) = value.c_str();
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  assert(value.null_terminated());
+
+  const char* const expected = results.front();
+
+  assert(expected != nullptr);
+  assert(std::string_view(expected) == "concurrent-substring");
+
+  bool all_pointers_equal = true;
+
+  for (const char* result : results) {
+    all_pointers_equal &= result == expected;
+  }
+
+  assert(all_pointers_equal);
+
+  std::cout << "  source: \"" << source << "\"\n"
+            << "  view: \"" << substring << "\"\n"
+            << "  threads: " << kThreadCount << "\n"
+            << "  all pointers equal: " << std::boolalpha << all_pointers_equal
+            << "\n"
+            << "  c_str(): \"" << expected << "\"\n";
+}
+
+// -----------------------------------------------------------------------------
+// Wide-character instantiation
+// -----------------------------------------------------------------------------
+
+// amitgdev::SaferStringView<wchar_t> is the primary motivating case for
+// c_str(): WinAPI parameters require a null-terminated wchar_t string, which a
+// std::wstring_view does not guarantee.
+static void TestWideCharInstantiation() {
+  const std::wstring source = L"prefix|wide substring|suffix";
+  const std::wstring_view substring = std::wstring_view(source).substr(7, 14);
+
+  assert(substring == L"wide substring");
+
+  const amitgdev::SaferStringView<wchar_t> value(substring);
+
+  assert(!value.null_terminated());
+  assert(!OwnsData(value));
+
+  const wchar_t* pointer = value.c_str();
+
+  assert(value.null_terminated());
+  assert(OwnsData(value));
+  assert(pointer != nullptr);
+
+  const std::wstring_view materialized(pointer);
+
+  assert(materialized.size() == substring.size());
+  assert(materialized == substring);
+  assert(std::wstring_view(value) == substring);
+
+  std::wcout << L"  source: \"" << source << L"\"\n"
+             << L"  view: \"" << substring << L"\"\n"
+             << L"  c_str(): \"" << materialized << L"\"\n";
 }
 
 // -----------------------------------------------------------------------------
@@ -210,9 +404,16 @@ static void TestEmptyStringView() {
   assert(!OwnsData(value));
   assert(!value.null_terminated());
 
-  std::cout << "  value: \"\"\n"
-            << "  owns: " << std::boolalpha << OwnsData(value) << "\n"
-            << "  null-terminated: " << value.null_terminated() << "\n";
+  const char* pointer = value.c_str();
+
+  assert(pointer != nullptr);
+  assert(*pointer == '\0');
+  assert(OwnsData(value));
+  assert(value.null_terminated());
+
+  std::cout << "  before c_str(): owns=false, null-terminated=false\n"
+            << "  after c_str(): owns=true, null-terminated=true\n"
+            << "  c_str(): \"" << pointer << "\"\n";
 }
 
 static void TestEmptyLiteral() {
@@ -252,9 +453,15 @@ int main() {
   run_test("MoveAssignment", TestMoveAssignment);
 
   run_test("StringViewConversion", TestStringViewConversion);
+  run_test("StringViewConsumer", TestStringViewConsumer);
 
   run_test("NullTerminationForKnownTerminatedInput",
            TestNullTerminationForKnownTerminatedInput);
+  run_test("MaterializesNonTerminatedView", TestMaterializesNonTerminatedView);
+  run_test("MaterializesEmptyView", TestMaterializesEmptyView);
+
+  run_test("ConcurrentCStr", TestConcurrentCStr);
+  run_test("WideCharInstantiation", TestWideCharInstantiation);
 
   run_test("EmptyString", TestEmptyString);
   run_test("EmptyStringView", TestEmptyStringView);
