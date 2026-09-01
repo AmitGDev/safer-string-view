@@ -24,6 +24,9 @@
     IN THE SOFTWARE.
 */
 
+#include <atomic>
+#include <cassert>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -36,6 +39,19 @@
  *
  * @warning Cannot detect temporaries passed via string_view:
  *          SaferStringView(std::string_view(std::to_string(2025))) // Dangling!
+ *
+ * @thread_safety
+ * c_str() and null_terminated() may be called concurrently on the same
+ * SaferStringView object. c_str() is the only operation that guarantees a
+ * usable null-terminated pointer.
+ *
+ * The object must not be copied, moved, assigned, converted to
+ * std::basic_string_view, or destroyed concurrently with either operation
+ * unless externally synchronized.
+ *
+ * Other accesses are not synchronized. In particular, concurrent mutation
+ * of an lvalue string referenced by this object remains the caller's
+ * responsibility.
  */
 template <typename T>
   requires requires { typename std::char_traits<T>; }
@@ -57,6 +73,43 @@ class SaferStringView final {
   explicit SaferStringView(const T* str)
       : storage_(std::basic_string_view<T>(str)), null_terminated_(true) {}
 
+  // Rule of five: std::atomic and std::mutex are themselves neither copyable
+  // nor movable, which would otherwise silently delete these for the whole
+  // class. Defined manually so SaferStringView still works as a by-value
+  // function parameter, its primary intended use. Each copy/move gets its
+  // own mutex; only the logical state (storage_, null_terminated_) transfers.
+  SaferStringView(const SaferStringView& other)
+      : storage_(other.storage_),
+        null_terminated_(
+            other.null_terminated_.load(std::memory_order_relaxed)) {}
+
+  SaferStringView& operator=(const SaferStringView& other) {
+    if (this != &other) {
+      storage_ = other.storage_;
+      null_terminated_.store(
+          other.null_terminated_.load(std::memory_order_relaxed),
+          std::memory_order_relaxed);
+    }
+    return *this;
+  }
+
+  SaferStringView(SaferStringView&& other) noexcept
+      : storage_(std::move(other.storage_)),
+        null_terminated_(
+            other.null_terminated_.load(std::memory_order_relaxed)) {}
+
+  SaferStringView& operator=(SaferStringView&& other) noexcept {
+    if (this != &other) {
+      storage_ = std::move(other.storage_);
+      null_terminated_.store(
+          other.null_terminated_.load(std::memory_order_relaxed),
+          std::memory_order_relaxed);
+    }
+    return *this;
+  }
+
+  ~SaferStringView() = default;
+
   // Implicit conversion operator for drop-in string_view replacement
   // NOLINTBEGIN(google-explicit-constructor)
   constexpr
@@ -68,18 +121,56 @@ class SaferStringView final {
 
   // NOLINTEND(google-explicit-constructor)
 
+  // Guarantees a null-terminated pointer, materializing an owned copy on
+  // first use if the value came from a generic string_view with no such
+  // guarantee. Subsequent calls reuse the materialized storage.
+  //
+  // Safe to call concurrently with c_str() and null_terminated() on the
+  // same instance. Unlike null_terminated(), this operation guarantees a
+  // usable null-terminated pointer.
+  // NOLINTNEXTLINE(readability-identifier-naming)
+  [[nodiscard]] const T* c_str() const {
+    if (!null_terminated_.load(std::memory_order_acquire)) {
+      const std::lock_guard lock(materialize_mutex_);
+
+      // Re-check: another thread may have materialized while we waited.
+      if (!null_terminated_.load(std::memory_order_relaxed)) {
+        const auto* view = std::get_if<std::basic_string_view<T>>(&storage_);
+        assert(view != nullptr &&
+               "storage_ must hold a string_view when not null terminated");
+        storage_ = std::basic_string<T>(*view);
+        null_terminated_.store(true, std::memory_order_release);
+      }
+
+      return std::visit([](const auto& val) -> const T* { return val.data(); },
+                        storage_);
+    }
+
+    return std::visit([](const auto& val) -> const T* { return val.data(); },
+                      storage_);
+  }
+
+  // Reports whether the current representation is known to be null-terminated.
+  //
+  // This is informational only and must not be used as a check-then-use
+  // substitute. Call c_str() when a null-terminated pointer is required.
   // NOLINTNEXTLINE(readability-identifier-naming)
   [[nodiscard]] bool null_terminated() const noexcept {
-    return null_terminated_;
+    return null_terminated_.load(std::memory_order_acquire);
   }
 
  private:
-  bool null_terminated_;
+  // mutable: c_str() materializes an owned copy and flips this from a
+  // const-qualified accessor. load() is const-qualified on std::atomic, but
+  // store()/exchange() are not, so mutable is required here just as it is
+  // for storage_.
+  mutable std::atomic<bool> null_terminated_;
+  mutable std::mutex materialize_mutex_;
 #ifdef TEST_SAFERSTRINGVIEW
  public:
 #endif
-  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
-  std::variant<std::basic_string<T>, std::basic_string_view<T>> storage_;
+  mutable std::variant<std::basic_string<T>, std::basic_string_view<T>>
+      storage_;  // NOLINT(cppcoreguidelines-non-private-member-variables-in-classes)
 };
 
 #endif
