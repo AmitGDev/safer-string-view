@@ -167,20 +167,16 @@ class SaferStringView final {
    */
   // NOLINTNEXTLINE(readability-identifier-naming)
   [[nodiscard]] const T* c_str() const {
-    if (!null_terminated_.load(std::memory_order_acquire)) {
-      const std::lock_guard lock(materialize_mutex_);
+    const std::lock_guard lock(materialize_mutex_);
 
-      // Re-check: another thread may have materialized while we waited.
-      if (!null_terminated_.load(std::memory_order_relaxed)) {
-        const auto* view = std::get_if<std::basic_string_view<T>>(&storage_);
-        assert(view != nullptr &&
-               "storage_ must hold a string_view when not null terminated");
-        storage_ = std::basic_string<T>(*view);
-        null_terminated_.store(true, std::memory_order_release);
-      }
+    if (!null_terminated_.load(std::memory_order_relaxed)) {
+      const auto* view = std::get_if<std::basic_string_view<T>>(&storage_);
 
-      return std::visit([](const auto& val) -> const T* { return val.data(); },
-                        storage_);
+      assert(view != nullptr &&
+             "non-null-terminated storage must contain a string_view");
+
+      storage_ = std::basic_string<T>(*view);
+      null_terminated_.store(true, std::memory_order_relaxed);
     }
 
     return std::visit([](const auto& val) -> const T* { return val.data(); },
